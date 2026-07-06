@@ -144,6 +144,105 @@ def init_db() -> None:
         if col not in existing_cols:
             cur.execute(ddl)
     cur.execute("UPDATE songs SET source_video_id = video_id WHERE source_video_id IS NULL OR source_video_id = ''")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team TEXT NOT NULL,
+            source_query TEXT NOT NULL,
+            next_page_token TEXT DEFAULT '',
+            completed INTEGER DEFAULT 0,
+            pages_fetched INTEGER DEFAULT 0,
+            videos_seen INTEGER DEFAULT 0,
+            songs_inserted INTEGER DEFAULT 0,
+            songs_skipped INTEGER DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            started_at TEXT,
+            updated_at TEXT,
+            UNIQUE(team, source_query)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_collection_state(team: str, source_query: str) -> Dict:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM collection_state WHERE team = ? AND source_query = ?",
+        (team, source_query),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def reset_collection_state(team: str, source_query: str) -> None:
+    conn = get_conn()
+    conn.execute("DELETE FROM collection_state WHERE team = ? AND source_query = ?", (team, source_query))
+    conn.commit()
+    conn.close()
+
+
+def update_collection_state(
+    team: str,
+    source_query: str,
+    *,
+    next_page_token: str = '',
+    completed: int = 0,
+    page_delta: int = 0,
+    videos_delta: int = 0,
+    inserted_delta: int = 0,
+    skipped_delta: int = 0,
+    last_error: str = '',
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    existing = get_collection_state(team, source_query)
+    conn = get_conn()
+    if existing:
+        conn.execute(
+            """
+            UPDATE collection_state
+            SET next_page_token = ?, completed = ?, pages_fetched = pages_fetched + ?,
+                videos_seen = videos_seen + ?, songs_inserted = songs_inserted + ?,
+                songs_skipped = songs_skipped + ?, last_error = ?, updated_at = ?
+            WHERE team = ? AND source_query = ?
+            """,
+            (
+                next_page_token or '',
+                int(completed),
+                int(page_delta),
+                int(videos_delta),
+                int(inserted_delta),
+                int(skipped_delta),
+                last_error or '',
+                now,
+                team,
+                source_query,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO collection_state (
+                team, source_query, next_page_token, completed, pages_fetched, videos_seen,
+                songs_inserted, songs_skipped, last_error, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                team,
+                source_query,
+                next_page_token or '',
+                int(completed),
+                int(page_delta),
+                int(videos_delta),
+                int(inserted_delta),
+                int(skipped_delta),
+                last_error or '',
+                now,
+                now,
+            ),
+        )
     conn.commit()
     conn.close()
 
@@ -360,27 +459,34 @@ def should_exclude(title: str, exclude_keywords: Sequence[str], min_sec: int, ma
 
 def load_sources() -> pd.DataFrame:
     if not SOURCES_PATH.exists():
-        return pd.DataFrame(columns=["team", "search_queries", "priority", "notes"])
+        return pd.DataFrame(columns=["team", "search_queries", "notes"])
     df = pd.read_csv(SOURCES_PATH)
     df = df.dropna(how="all")
-    return df
+    # Older versions had a priority column. It is ignored now because the app collects all selected sources equally.
+    for col in ["team", "search_queries", "notes"]:
+        if col not in df.columns:
+            df[col] = ""
+    return df[["team", "search_queries", "notes"]].copy()
 
 
 def save_sources(df: pd.DataFrame) -> None:
-    df = df[["team", "search_queries", "priority", "notes"]].copy()
+    for col in ["team", "search_queries", "notes"]:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[["team", "search_queries", "notes"]].copy()
     df = df.dropna(how="all")
     df.to_csv(SOURCES_PATH, index=False, encoding="utf-8-sig")
 
 
-def add_or_update_source(team: str, search_queries: str, priority: int = 2, notes: str = "사용자 추가") -> None:
+def add_or_update_source(team: str, search_queries: str, notes: str = "사용자 추가") -> None:
     team = normalize_text(team)
     search_queries = normalize_text(search_queries)
     if not team or not search_queries:
         raise ValueError("찬양팀 이름과 검색어를 모두 입력해야 합니다.")
     df = load_sources()
-    new_row = {"team": team, "search_queries": search_queries, "priority": int(priority), "notes": notes}
+    new_row = {"team": team, "search_queries": search_queries, "notes": notes}
     if not df.empty and team in df["team"].astype(str).tolist():
-        df.loc[df["team"].astype(str) == team, ["search_queries", "priority", "notes"]] = [search_queries, int(priority), notes]
+        df.loc[df["team"].astype(str) == team, ["search_queries", "notes"]] = [search_queries, notes]
     else:
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     save_sources(df)
@@ -942,7 +1048,7 @@ st.set_page_config(page_title="찬양 콘티 자동 추천기", page_icon="🎵"
 init_db()
 
 st.title("🎵 찬양곡 DB 자동 수집 + 콘티 추천기")
-st.caption("YouTube 기반 자동 수집 → 사람이 키/BPM/코드/악보 링크 검수 → 검수 완료 곡으로 콘티 추천")
+st.caption("YouTube 기반 전체 자동 수집 → 사람이 키/BPM/코드 검수 → 검수 완료 곡으로 콘티 추천")
 
 with st.sidebar:
     st.header("설정")
@@ -984,30 +1090,38 @@ if menu == "1. DB 자동 수집":
         add_c1, add_c2 = st.columns([1, 2])
         with add_c1:
             new_team = st.text_input("추가할 찬양팀 이름")
-            new_priority = st.number_input("우선순위", min_value=1, max_value=9, value=2, step=1)
         with add_c2:
             new_queries = st.text_input("검색어 묶음", placeholder="검색어를 | 로 구분해서 입력")
             new_notes = st.text_input("메모", value="사용자 추가")
         if st.button("찬양팀 목록에 저장"):
             try:
-                add_or_update_source(new_team, new_queries, int(new_priority), new_notes)
+                add_or_update_source(new_team, new_queries, new_notes)
                 st.success("찬양팀 목록에 저장했습니다. 화면을 새로고침하면 선택 목록에 보입니다.")
                 sources = load_sources()
             except Exception as e:
                 st.error(str(e))
 
+    st.info("이 버전은 찬양팀 우선순위를 쓰지 않습니다. 선택한 모든 찬양팀/검색어를 동일하게 수집하고, 각 검색어는 YouTube가 제공하는 다음 페이지가 없을 때까지 계속 가져옵니다.")
     col_a, col_b = st.columns([2, 1])
     with col_a:
-        default_selected = sources[sources["priority"] <= 2]["team"].tolist()
         selected_teams = st.multiselect(
             "수집할 찬양팀 선택",
             options=sources["team"].tolist(),
-            default=default_selected,
+            default=sources["team"].tolist(),
+            help="기본값은 전체 선택입니다. 모든 팀을 DB에 넣고 싶으면 그대로 두면 됩니다.",
         )
     with col_b:
-        per_query_results = st.number_input("검색어당 가져올 영상 수", min_value=1, max_value=50, value=10, step=1)
-        min_sec = st.number_input("최소 영상 길이(초)", min_value=0, max_value=600, value=120, step=30)
-        max_sec = st.number_input("최대 영상 길이(초)", min_value=180, max_value=14400, value=3600, step=60)
+        st.metric("검색 페이지 크기", "50개")
+        st.caption("YouTube API의 검색 1페이지 최대값인 50개로 고정합니다. 앱이 nextPageToken을 따라 끝까지 가져옵니다.")
+        resume_collection = st.checkbox("이전 중단 지점부터 이어서 수집", value=True, help="quota 초과/네트워크 오류로 멈췄던 검색어는 저장된 다음 페이지 토큰부터 재개합니다.")
+        reset_before_collect = st.checkbox("선택한 검색어의 수집 진행상태 초기화", value=False, help="처음 페이지부터 다시 훑고 싶을 때만 체크하세요. 이미 DB에 있는 영상은 중복 저장되지 않습니다.")
+        use_optional_filter = st.checkbox("제외 키워드/길이 필터 적용", value=False, help="기본은 모든 영상을 저장합니다. 커버, MR, 너무 긴 영상 등을 제외하고 싶을 때만 켜세요.")
+        if use_optional_filter:
+            min_sec = st.number_input("최소 영상 길이(초)", min_value=0, max_value=600, value=0, step=30)
+            max_sec = st.number_input("최대 영상 길이(초)", min_value=180, max_value=28800, value=14400, step=60)
+        else:
+            min_sec = 0
+            max_sec = 10**9
         use_nvidia_enrichment = st.checkbox(
             "NVIDIA AI로 DB 자동 분류",
             value=True,
@@ -1018,10 +1132,12 @@ if menu == "1. DB 자동 수집":
             value=True,
             help="NVIDIA API가 필요합니다. 설명란 타임스탬프가 있으면 같은 영상을 여러 곡으로 저장합니다.",
         )
-        max_songs_per_video = st.number_input("영상 1개당 최대 분리 곡 수", min_value=1, max_value=30, value=12, step=1)
+        max_songs_per_video = st.number_input("영상 1개당 최대 분리 곡 수", min_value=1, max_value=60, value=20, step=1)
 
-    exclude_text = st.text_area("제외 키워드", value=", ".join(DEFAULT_EXCLUDE_KEYWORDS), height=90)
-    exclude_keywords = [x.strip() for x in exclude_text.split(",") if x.strip()]
+    exclude_keywords = []
+    if use_optional_filter:
+        exclude_text = st.text_area("제외 키워드", value=", ".join(DEFAULT_EXCLUDE_KEYWORDS), height=90)
+        exclude_keywords = [x.strip() for x in exclude_text.split(",") if x.strip()]
 
     st.dataframe(sources[sources["team"].isin(selected_teams)], use_container_width=True)
 
@@ -1074,7 +1190,7 @@ if menu == "1. DB 자동 수집":
 
     st.divider()
 
-    if st.button("선택한 찬양팀 자동 수집 시작", type="primary"):
+    if st.button("선택한 찬양팀 전체 자동 수집 시작", type="primary"):
         if not api_key:
             st.error("YouTube Data API Key를 입력해주세요.")
             st.stop()
@@ -1082,53 +1198,118 @@ if menu == "1. DB 자동 수집":
         selected = sources[sources["team"].isin(selected_teams)]
         total_inserted = 0
         total_skipped = 0
+        total_videos = 0
+        total_pages = 0
         progress = st.progress(0)
         log_box = st.empty()
         logs = []
         tasks = []
         for _, row in selected.iterrows():
             for q in str(row["search_queries"]).split("|"):
-                tasks.append((row["team"], q.strip()))
+                q = q.strip()
+                if q:
+                    tasks.append((row["team"], q))
 
         for idx, (team, query) in enumerate(tasks, start=1):
-            try:
-                search_json = youtube_search(api_key, query, max_results=int(per_query_results))
-                video_ids = [item["id"].get("videoId") for item in search_json.get("items", []) if item.get("id", {}).get("videoId")]
-                details_json = youtube_videos(api_key, video_ids)
+            if reset_before_collect:
+                reset_collection_state(team, query)
 
-                for item in details_json.get("items", []):
-                    snippet = item.get("snippet", {})
-                    content = item.get("contentDetails", {})
-                    duration_sec = iso8601_duration_to_seconds(content.get("duration", ""))
-                    raw_title = snippet.get("title", "")
-                    if should_exclude(raw_title, exclude_keywords, int(min_sec), int(max_sec), duration_sec):
-                        total_skipped += 1
-                        continue
+            state = get_collection_state(team, query) if resume_collection else {}
+            if state.get("completed") and resume_collection:
+                logs.append(f"⏭️ {team} / {query}: 이미 끝까지 수집 완료")
+                progress.progress(idx / max(len(tasks), 1))
+                log_box.text("\n".join(logs[-18:]))
+                continue
 
-                    song_rows, row_logs = build_song_rows_from_video_item(
-                        item=item,
-                        team=team,
-                        source_query=query,
-                        use_nvidia_enrichment=bool(use_nvidia_enrichment),
-                        split_multi_song_videos=bool(split_multi_song_videos),
-                        nvidia_api_key=nvidia_api_key,
-                        nvidia_base_url=nvidia_base_url,
-                        nvidia_model=nvidia_model,
-                        max_songs_per_video=int(max_songs_per_video),
+            page_token = state.get("next_page_token", "") if resume_collection else ""
+            query_inserted = 0
+            query_skipped = 0
+            query_videos = 0
+            query_pages = 0
+
+            while True:
+                try:
+                    search_json = youtube_search(api_key, query, max_results=50, page_token=page_token or None)
+                    query_pages += 1
+                    total_pages += 1
+                    video_ids = [item["id"].get("videoId") for item in search_json.get("items", []) if item.get("id", {}).get("videoId")]
+                    query_videos += len(video_ids)
+                    total_videos += len(video_ids)
+                    details_json = youtube_videos(api_key, video_ids)
+
+                    page_inserted = 0
+                    page_skipped = 0
+                    for item in details_json.get("items", []):
+                        snippet = item.get("snippet", {})
+                        content = item.get("contentDetails", {})
+                        duration_sec = iso8601_duration_to_seconds(content.get("duration", ""))
+                        raw_title = snippet.get("title", "")
+                        if should_exclude(raw_title, exclude_keywords, int(min_sec), int(max_sec), duration_sec):
+                            page_skipped += 1
+                            continue
+
+                        song_rows, row_logs = build_song_rows_from_video_item(
+                            item=item,
+                            team=team,
+                            source_query=query,
+                            use_nvidia_enrichment=bool(use_nvidia_enrichment),
+                            split_multi_song_videos=bool(split_multi_song_videos),
+                            nvidia_api_key=nvidia_api_key,
+                            nvidia_base_url=nvidia_base_url,
+                            nvidia_model=nvidia_model,
+                            max_songs_per_video=int(max_songs_per_video),
+                        )
+                        logs.extend(row_logs)
+                        for song in song_rows:
+                            if upsert_song(song):
+                                page_inserted += 1
+                            else:
+                                page_skipped += 1
+
+                    total_inserted += page_inserted
+                    total_skipped += page_skipped
+                    query_inserted += page_inserted
+                    query_skipped += page_skipped
+
+                    next_page_token = search_json.get("nextPageToken", "") or ""
+                    completed = 0 if next_page_token else 1
+                    update_collection_state(
+                        team,
+                        query,
+                        next_page_token=next_page_token,
+                        completed=completed,
+                        page_delta=1,
+                        videos_delta=len(video_ids),
+                        inserted_delta=page_inserted,
+                        skipped_delta=page_skipped,
                     )
-                    logs.extend(row_logs)
-                    for song in song_rows:
-                        if upsert_song(song):
-                            total_inserted += 1
-                        else:
-                            total_skipped += 1
-                logs.append(f"✅ {team} / {query}: 완료")
-            except Exception as e:
-                logs.append(f"⚠️ {team} / {query}: 오류 - {e}")
-            progress.progress(idx / max(len(tasks), 1))
-            log_box.text("\n".join(logs[-12:]))
 
-        st.success(f"수집 완료: 신규 저장 {total_inserted}개, 중복/제외 {total_skipped}개")
+                    logs.append(
+                        f"✅ {team} / {query}: {query_pages}페이지, 영상 {query_videos}개 확인, 신규 {query_inserted}곡, 중복/제외 {query_skipped}개"
+                    )
+                    progress.progress(min((idx - 1 + 0.5) / max(len(tasks), 1), 1.0))
+                    log_box.text("\n".join(logs[-18:]))
+
+                    if not next_page_token:
+                        break
+                    page_token = next_page_token
+
+                except Exception as e:
+                    update_collection_state(
+                        team,
+                        query,
+                        next_page_token=page_token or "",
+                        completed=0,
+                        last_error=str(e),
+                    )
+                    logs.append(f"⚠️ {team} / {query}: 중단 - {e}")
+                    logs.append("   다음에 다시 실행하면 저장된 지점부터 이어서 수집할 수 있습니다.")
+                    break
+
+            progress.progress(idx / max(len(tasks), 1))
+            log_box.text("\n".join(logs[-18:]))
+
+        st.success(f"전체 수집 실행 완료: 검색 페이지 {total_pages}개, 영상 {total_videos}개 확인, 신규 저장 {total_inserted}곡, 중복/제외 {total_skipped}개")
 
     st.divider()
     st.subheader("최근 수집된 곡")
@@ -1396,7 +1577,28 @@ elif menu == "4. DB 관리":
         st.download_button("CSV로 내보내기", data=csv, file_name="worship_songs_export.csv", mime="text/csv")
 
     st.divider()
+    st.subheader("수집 진행상태")
+    state_df = query_df(
+        """
+        SELECT team, source_query, completed, pages_fetched, videos_seen, songs_inserted, songs_skipped,
+               next_page_token, last_error, updated_at
+        FROM collection_state
+        ORDER BY completed ASC, updated_at DESC
+        """
+    )
+    if state_df.empty:
+        st.info("아직 저장된 수집 진행상태가 없습니다.")
+    else:
+        st.dataframe(state_df, use_container_width=True)
+        if st.button("모든 수집 진행상태 초기화"):
+            conn = get_conn()
+            conn.execute("DELETE FROM collection_state")
+            conn.commit()
+            conn.close()
+            st.success("수집 진행상태를 초기화했습니다. DB에 저장된 곡은 삭제하지 않았습니다.")
+
+    st.divider()
     st.subheader("기본 찬양팀 목록 수정")
     sources = load_sources()
-    st.write("worship_sources.csv 파일을 수정하면 자동 수집 대상 찬양팀과 검색어를 늘릴 수 있습니다.")
+    st.write("worship_sources.csv 파일을 수정하면 자동 수집 대상 찬양팀과 검색어를 늘릴 수 있습니다. 우선순위는 사용하지 않습니다.")
     st.dataframe(sources, use_container_width=True)
