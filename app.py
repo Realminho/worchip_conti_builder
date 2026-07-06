@@ -287,7 +287,7 @@ def upsert_song(song: Dict) -> bool:
                 published_at, duration_iso, duration_seconds, description, speed, theme,
                 is_medley, medley_song_count, medley_songs, ai_analyzed, ai_note,
                 source_query, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 song.get("video_id"),
