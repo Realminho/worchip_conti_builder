@@ -5,6 +5,7 @@ import time
 import os
 import re
 import sqlite3
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -389,6 +390,82 @@ def youtube_videos(api_key: str, video_ids: Sequence[str]) -> Dict:
     return response.json()
 
 
+def youtube_channel_search(api_key: str, query: str, max_results: int = 8) -> List[Dict]:
+    """Find YouTube channel candidates by team/name.
+
+    This uses YouTube Data API search.list with type=channel. It is meant for
+    one-time channel discovery when the user adds a new worship team.
+    """
+    if not api_key:
+        return []
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "key": api_key,
+        "part": "snippet",
+        "q": query,
+        "type": "channel",
+        "maxResults": min(max_results, 50),
+        "order": "relevance",
+        "safeSearch": "none",
+        "relevanceLanguage": "ko",
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    candidates: List[Dict] = []
+    for item in response.json().get("items", []):
+        raw_id = item.get("id", {})
+        channel_id = raw_id.get("channelId") if isinstance(raw_id, dict) else ""
+        snippet = item.get("snippet", {})
+        if channel_id:
+            candidates.append({
+                "channel_id": channel_id,
+                "title": snippet.get("title", ""),
+                "description": snippet.get("description", ""),
+                "published_at": snippet.get("publishedAt", ""),
+                "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+                "rss_url": f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
+            })
+    return candidates
+
+
+def youtube_channel_uploads_playlist(api_key: str, channel_id: str) -> str:
+    """Return a channel's uploads playlist id using YouTube Data API."""
+    url = "https://www.googleapis.com/youtube/v3/channels"
+    params = {
+        "key": api_key,
+        "part": "contentDetails",
+        "id": channel_id,
+        "maxResults": 1,
+    }
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    items = response.json().get("items", [])
+    if not items:
+        return ""
+    return (
+        items[0]
+        .get("contentDetails", {})
+        .get("relatedPlaylists", {})
+        .get("uploads", "")
+    )
+
+
+def youtube_playlist_items(api_key: str, playlist_id: str, page_token: Optional[str] = None, max_results: int = 50) -> Dict:
+    """Fetch items from a YouTube playlist, used for channel uploads collection."""
+    url = "https://www.googleapis.com/youtube/v3/playlistItems"
+    params = {
+        "key": api_key,
+        "part": "snippet,contentDetails",
+        "playlistId": playlist_id,
+        "maxResults": min(max_results, 50),
+    }
+    if page_token:
+        params["pageToken"] = page_token
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
 def extract_youtube_video_id(value: str) -> str:
     """Extract a YouTube video id from youtu.be / watch?v= / shorts URLs or raw id."""
     value = normalize_text(value)
@@ -405,6 +482,144 @@ def extract_youtube_video_id(value: str) -> str:
         if m:
             return m.group(1)[:32]
     return ""
+
+def extract_youtube_channel_id(value: str) -> str:
+    """Extract a YouTube channel id from a channel id, RSS URL, /channel/ URL, or @handle page.
+
+    Important: a handle URL like https://www.youtube.com/@FIAWORSHIP is not itself an RSS feed.
+    The app fetches that page, finds the channel_id/RSS link, and then uses
+    https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID.
+    """
+    value = normalize_text(value)
+    if not value:
+        return ""
+
+    # Raw channel id or URL containing channel_id.
+    direct_patterns = [
+        r"(?:channel_id=)(UC[A-Za-z0-9_-]{20,})",
+        r"youtube\.com/channel/(UC[A-Za-z0-9_-]{20,})",
+        r"^(UC[A-Za-z0-9_-]{20,})$",
+    ]
+    for pat in direct_patterns:
+        m = re.search(pat, value)
+        if m:
+            return m.group(1)
+
+    # Handle/custom URLs require one page fetch. This does not use YouTube Data API quota.
+    if "youtube.com/" in value:
+        url = value
+    elif value.startswith("@"):
+        url = f"https://www.youtube.com/{value}"
+    else:
+        url = f"https://www.youtube.com/@{value}"
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers, timeout=20)
+    response.raise_for_status()
+    html = response.text
+
+    # Most reliable: RSS alternate link in the page source.
+    m = re.search(r"https://www\.youtube\.com/feeds/videos\.xml\?channel_id=(UC[A-Za-z0-9_-]{20,})", html)
+    if m:
+        return m.group(1)
+
+    # Fallbacks commonly present in YouTube page source.
+    for pat in [r'"channelId":"(UC[A-Za-z0-9_-]{20,})"', r'"browseId":"(UC[A-Za-z0-9_-]{20,})"']:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def youtube_rss_url_from_channel_input(channel_value: str) -> Tuple[str, str]:
+    """Return (rss_url, channel_id) from channel id/handle/channel URL/RSS URL."""
+    channel_value = normalize_text(channel_value)
+    if not channel_value:
+        return "", ""
+    if "feeds/videos.xml" in channel_value and "channel_id=" in channel_value:
+        channel_id = extract_youtube_channel_id(channel_value)
+        return channel_value, channel_id
+    channel_id = extract_youtube_channel_id(channel_value)
+    if not channel_id:
+        return "", ""
+    return f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}", channel_id
+
+
+def fetch_youtube_rss_entries(channel_value: str) -> Tuple[List[Dict], str, str]:
+    """Fetch a YouTube channel RSS feed without YouTube Data API quota.
+
+    RSS generally returns recent uploads only. It is useful as the quota-free/default collector,
+    not as a guaranteed full historical archive.
+    """
+    rss_url, channel_id = youtube_rss_url_from_channel_input(channel_value)
+    if not rss_url:
+        raise ValueError("채널 ID/RSS URL을 찾지 못했습니다. 예: https://www.youtube.com/@FIAWORSHIP 또는 UC... 형식")
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(rss_url, headers=headers, timeout=20)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+    entries: List[Dict] = []
+    for entry in root.findall("atom:entry", ns):
+        video_id = (entry.findtext("yt:videoId", default="", namespaces=ns) or "").strip()
+        title = (entry.findtext("atom:title", default="", namespaces=ns) or "").strip()
+        published = (entry.findtext("atom:published", default="", namespaces=ns) or "").strip()
+        author_name = ""
+        author = entry.find("atom:author", ns)
+        if author is not None:
+            author_name = (author.findtext("atom:name", default="", namespaces=ns) or "").strip()
+        description = ""
+        media_group = entry.find("media:group", ns)
+        if media_group is not None:
+            description = (media_group.findtext("media:description", default="", namespaces=ns) or "").strip()
+        if video_id:
+            entries.append(
+                {
+                    "video_id": video_id,
+                    "title": title,
+                    "published_at": published,
+                    "channel_title": author_name,
+                    "description": description,
+                    "rss_url": rss_url,
+                    "channel_id": channel_id,
+                }
+            )
+    return entries, rss_url, channel_id
+
+
+def build_video_row_from_rss_entry(entry: Dict, team: str, source_query: str) -> Dict:
+    """Store one RSS entry as one DB item. Only URL + metadata are stored."""
+    source_video_id = entry.get("video_id", "")
+    raw_title = entry.get("title", "")
+    return {
+        "video_id": source_video_id,
+        "source_video_id": source_video_id,
+        "song_index": 1,
+        "segment_label": "",
+        "segment_start_seconds": None,
+        "raw_title": raw_title,
+        "clean_title": clean_video_title(raw_title, team),
+        "team": team,
+        "channel_title": entry.get("channel_title", ""),
+        "video_url": video_url_with_start(source_video_id, None),
+        "published_at": entry.get("published_at", ""),
+        "duration_iso": "",
+        "duration_seconds": 0,
+        "description": entry.get("description", ""),
+        "speed": "미확인",
+        "theme": "미확인",
+        "is_medley": 0,
+        "medley_song_count": 1,
+        "medley_songs": "",
+        "ai_analyzed": 0,
+        "ai_note": "YouTube RSS 수집 단계에서 저장됨. NVIDIA 분석 전.",
+        "source_query": source_query,
+    }
 
 # -----------------------------
 # Text cleaning / guesses
@@ -490,34 +705,39 @@ def should_exclude(title: str, exclude_keywords: Sequence[str], min_sec: int, ma
 
 def load_sources() -> pd.DataFrame:
     if not SOURCES_PATH.exists():
-        return pd.DataFrame(columns=["team", "search_queries", "notes"])
+        return pd.DataFrame(columns=["team", "search_queries", "channel_urls", "notes"])
     df = pd.read_csv(SOURCES_PATH)
     df = df.dropna(how="all")
-    # Older versions had a priority column. It is ignored now because the app collects all selected sources equally.
-    for col in ["team", "search_queries", "notes"]:
+    # Older versions had only team/search_queries/notes. Channel URLs are optional.
+    for col in ["team", "search_queries", "channel_urls", "notes"]:
         if col not in df.columns:
             df[col] = ""
-    return df[["team", "search_queries", "notes"]].copy()
+    return df[["team", "search_queries", "channel_urls", "notes"]].copy()
 
 
 def save_sources(df: pd.DataFrame) -> None:
-    for col in ["team", "search_queries", "notes"]:
+    for col in ["team", "search_queries", "channel_urls", "notes"]:
         if col not in df.columns:
             df[col] = ""
-    df = df[["team", "search_queries", "notes"]].copy()
+    df = df[["team", "search_queries", "channel_urls", "notes"]].copy()
     df = df.dropna(how="all")
     df.to_csv(SOURCES_PATH, index=False, encoding="utf-8-sig")
 
 
-def add_or_update_source(team: str, search_queries: str, notes: str = "사용자 추가") -> None:
+def add_or_update_source(team: str, search_queries: str, channel_urls: str = "", notes: str = "사용자 추가") -> None:
     team = normalize_text(team)
     search_queries = normalize_text(search_queries)
-    if not team or not search_queries:
-        raise ValueError("찬양팀 이름과 검색어를 모두 입력해야 합니다.")
+    channel_urls = normalize_text(channel_urls)
+    if not team:
+        raise ValueError("찬양팀 이름을 입력해야 합니다.")
+    # 사용자가 팀 이름만 넣어도 일단 저장되게 기본 검색어를 자동 생성합니다.
+    # 채널 ID/URL은 YouTube API 채널 자동 찾기에서 나중에 보강할 수 있습니다.
+    if not search_queries:
+        search_queries = f"{team} 찬양|{team} worship|{team} 라이브|{team} 예배"
     df = load_sources()
-    new_row = {"team": team, "search_queries": search_queries, "notes": notes}
+    new_row = {"team": team, "search_queries": search_queries, "channel_urls": channel_urls, "notes": notes}
     if not df.empty and team in df["team"].astype(str).tolist():
-        df.loc[df["team"].astype(str) == team, ["search_queries", "notes"]] = [search_queries, notes]
+        df.loc[df["team"].astype(str) == team, ["search_queries", "channel_urls", "notes"]] = [search_queries, channel_urls, notes]
     else:
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     save_sources(df)
@@ -979,6 +1199,44 @@ def build_video_row_from_search_item(search_item: Dict, team: str, source_query:
     }
 
 
+def build_video_row_from_playlist_item(playlist_item: Dict, team: str, source_query: str) -> Optional[Dict]:
+    """Store one channel uploads playlist item as one DB row.
+
+    This saves only the YouTube URL and basic metadata. Duration remains 0
+    until a later detail refresh/analyze step.
+    """
+    snippet = playlist_item.get("snippet", {})
+    content_details = playlist_item.get("contentDetails", {})
+    source_video_id = content_details.get("videoId") or snippet.get("resourceId", {}).get("videoId", "")
+    if not source_video_id:
+        return None
+    raw_title = snippet.get("title", "")
+    return {
+        "video_id": source_video_id,
+        "source_video_id": source_video_id,
+        "song_index": 1,
+        "segment_label": "",
+        "segment_start_seconds": None,
+        "raw_title": raw_title,
+        "clean_title": clean_video_title(raw_title, team),
+        "team": team,
+        "channel_title": snippet.get("channelTitle", ""),
+        "video_url": video_url_with_start(source_video_id, None),
+        "published_at": snippet.get("publishedAt", ""),
+        "duration_iso": "",
+        "duration_seconds": 0,
+        "description": snippet.get("description", ""),
+        "speed": "미확인",
+        "theme": "미확인",
+        "is_medley": 0,
+        "medley_song_count": 1,
+        "medley_songs": "",
+        "ai_analyzed": 0,
+        "ai_note": "YouTube 채널 업로드 목록 수집 단계에서 저장됨. NVIDIA 분석 전.",
+        "source_query": source_query,
+    }
+
+
 def normalize_medley_songs(value) -> List[str]:
     """Return a clean list of song titles from AI output or existing DB text."""
     if value is None:
@@ -1420,7 +1678,7 @@ with st.sidebar:
 
 if menu == "1. DB 자동 수집":
     st.subheader("1. 유튜브 기반 찬양곡 후보 자동 수집")
-    st.write("기본 찬양팀 목록에서 선택하면 팀별 검색어를 돌려서 영상 파일이 아니라 유튜브 링크와 메타데이터 후보를 DB에 저장합니다.")
+    st.write("수집 방식을 선택할 수 있습니다. 기본 추천은 YouTube API 키 없이 가능한 채널 RSS 수집입니다. 영상 파일은 저장하지 않고 유튜브 링크와 메타데이터만 저장합니다.")
 
     sources = load_sources()
     if sources.empty:
@@ -1428,22 +1686,82 @@ if menu == "1. DB 자동 수집":
         st.stop()
 
     with st.expander("➕ 자동 수집 찬양팀 직접 추가/수정", expanded=False):
-        st.write("예: 아가파오 워십 / 아가파오 워십 찬양|AGAPAO Worship Korea|아가파오 워십 라이브")
+        st.write("팀 이름만 입력해도 저장됩니다. YouTube API 키가 있으면 채널 후보를 자동으로 찾아 채널 ID/RSS 주소까지 저장할 수 있습니다.")
+        if "new_source_channel_urls" not in st.session_state:
+            st.session_state["new_source_channel_urls"] = ""
+        if "channel_search_candidates" not in st.session_state:
+            st.session_state["channel_search_candidates"] = []
+
         add_c1, add_c2 = st.columns([1, 2])
         with add_c1:
-            new_team = st.text_input("추가할 찬양팀 이름")
+            new_team = st.text_input("추가할 찬양팀 이름", placeholder="예: 피아워십")
+            auto_query_text = f"{new_team} 찬양|{new_team} worship|{new_team} 라이브|{new_team} 예배" if new_team else ""
+            st.caption("검색어를 비워두면 팀 이름 기준으로 자동 생성됩니다.")
         with add_c2:
-            new_queries = st.text_input("검색어 묶음", placeholder="검색어를 | 로 구분해서 입력")
+            new_queries = st.text_input("검색어 묶음", value=auto_query_text, placeholder="검색어를 | 로 구분해서 입력")
+            new_channel_urls = st.text_input(
+                "채널/RSS URL 묶음",
+                placeholder="자동 찾기로 채널 ID를 넣거나, https://www.youtube.com/@FIAWORSHIP 를 입력",
+                key="new_source_channel_urls",
+            )
             new_notes = st.text_input("메모", value="사용자 추가")
+
+        st.markdown("#### 🔎 새 팀 채널 자동 찾기")
+        st.caption("YouTube API 키가 있을 때 팀 이름으로 채널 후보를 검색합니다. 한 번 찾은 채널 ID/RSS 주소를 저장하면 이후 RSS 수집은 API 키 없이 가능합니다.")
+        search_c1, search_c2 = st.columns([2, 1])
+        with search_c1:
+            channel_search_query = st.text_input("채널 검색어", value=new_team or "", placeholder="예: 피아워십, FIA WORSHIP")
+        with search_c2:
+            channel_candidate_count = st.number_input("후보 개수", min_value=1, max_value=20, value=8, step=1)
+        if st.button("YouTube API로 채널 후보 찾기"):
+            if not api_key:
+                st.warning("채널 자동 찾기는 YouTube Data API 키가 필요합니다. 키가 없으면 채널 핸들 URL이나 채널 ID를 직접 넣어주세요.")
+            elif not normalize_text(channel_search_query):
+                st.warning("채널 검색어를 입력해주세요.")
+            else:
+                try:
+                    st.session_state["channel_search_candidates"] = youtube_channel_search(api_key, channel_search_query, int(channel_candidate_count))
+                    if not st.session_state["channel_search_candidates"]:
+                        st.warning("채널 후보를 찾지 못했습니다. 검색어를 더 구체적으로 입력해보세요.")
+                except Exception as e:
+                    st.error(f"채널 후보 검색 실패: {sanitize_error_message(e, api_key)}")
+
+        candidates = st.session_state.get("channel_search_candidates", [])
+        if candidates:
+            candidate_labels = [
+                f"{i+1}. {c.get('title','미확인')} / {c.get('channel_id','')}"
+                for i, c in enumerate(candidates)
+            ]
+            selected_label = st.selectbox("저장할 채널 후보 선택", candidate_labels)
+            selected_idx = candidate_labels.index(selected_label)
+            selected_candidate = candidates[selected_idx]
+            st.write("선택 후보 설명:", selected_candidate.get("description", "")[:300])
+            st.code(selected_candidate.get("rss_url", ""))
+            if st.button("선택한 채널을 채널/RSS URL 칸에 넣기"):
+                current_urls = normalize_text(st.session_state.get("new_source_channel_urls", ""))
+                new_url = selected_candidate.get("channel_url", "")
+                if current_urls and new_url not in current_urls:
+                    st.session_state["new_source_channel_urls"] = current_urls + "|" + new_url
+                elif not current_urls:
+                    st.session_state["new_source_channel_urls"] = new_url
+                st.success("선택한 채널 URL을 입력칸에 반영했습니다. 필요하면 찬양팀 목록에 저장을 눌러주세요.")
+                st.rerun()
+
         if st.button("찬양팀 목록에 저장"):
             try:
-                add_or_update_source(new_team, new_queries, new_notes)
+                add_or_update_source(new_team, new_queries, st.session_state.get("new_source_channel_urls", ""), new_notes)
                 st.success("찬양팀 목록에 저장했습니다. 화면을 새로고침하면 선택 목록에 보입니다.")
                 sources = load_sources()
             except Exception as e:
                 st.error(str(e))
 
-    st.info("이 버전은 찬양팀 우선순위를 쓰지 않습니다. 선택한 모든 찬양팀/검색어를 동일하게 수집하고, 각 검색어는 YouTube가 제공하는 다음 페이지가 없을 때까지 계속 가져옵니다.")
+    collection_method = st.radio(
+        "수집 방식 선택",
+        ["채널 RSS 수집(API 키 없음, 추천)", "YouTube API 채널 수집(쿼터 절약)", "YouTube API 검색 수집(넓게 수집, 쿼터 많이 사용)", "직접 URL 저장", "CSV 가져오기"],
+        horizontal=False,
+        help="RSS는 API 키/쿼터 없이 최근 업로드 중심으로 수집합니다. 채널 수집은 공식 채널 업로드 목록 중심이라 검색보다 쿼터를 아낍니다.",
+    )
+    st.info("찬양팀 우선순위는 쓰지 않습니다. 선택한 모든 찬양팀/채널/검색어를 동일하게 수집합니다.")
     col_a, col_b = st.columns([2, 1])
     with col_a:
         selected_teams = st.multiselect(
@@ -1473,8 +1791,280 @@ if menu == "1. DB 자동 수집":
 
     st.dataframe(sources[sources["team"].isin(selected_teams)], use_container_width=True)
 
+    if collection_method == "채널 RSS 수집(API 키 없음, 추천)":
+        st.markdown("### 📡 채널 RSS 수집")
+        st.caption("`https://www.youtube.com/@FIAWORSHIP` 같은 핸들 URL은 RSS가 아닙니다. 앱이 채널 ID를 찾아 `feeds/videos.xml?channel_id=...` RSS 주소로 변환합니다. RSS는 보통 최근 업로드 중심으로 제공됩니다.")
+        extra_rss_urls = st.text_area(
+            "추가로 수집할 채널/RSS URL",
+            placeholder="https://www.youtube.com/@FIAWORSHIP\nhttps://www.youtube.com/feeds/videos.xml?channel_id=UC...",
+            height=90,
+        )
+        if st.button("선택한 찬양팀 채널 RSS 수집 시작", type="primary"):
+            selected = sources[sources["team"].isin(selected_teams)]
+            tasks = []
+            for _, row in selected.iterrows():
+                for raw_url in str(row.get("channel_urls", "")).split("|"):
+                    raw_url = raw_url.strip()
+                    if raw_url:
+                        tasks.append((row["team"], raw_url))
+            for raw_url in [x.strip() for x in extra_rss_urls.splitlines() if x.strip()]:
+                tasks.append(("직접 추가 RSS", raw_url))
+
+            if not tasks:
+                st.warning("선택한 찬양팀에 channel_urls가 없습니다. 찬양팀 추가/수정에서 채널 URL을 넣거나, 추가 URL 칸에 직접 입력해주세요.")
+            else:
+                total_inserted = 0
+                total_skipped = 0
+                total_seen = 0
+                progress = st.progress(0)
+                log_box = st.empty()
+                logs = []
+                for idx, (team, channel_value) in enumerate(tasks, start=1):
+                    try:
+                        entries, rss_url, channel_id = fetch_youtube_rss_entries(channel_value)
+                        inserted = 0
+                        skipped = 0
+                        for entry in entries:
+                            song = build_video_row_from_rss_entry(entry, team=team, source_query=f"RSS:{rss_url}")
+                            if upsert_song(song):
+                                inserted += 1
+                            else:
+                                skipped += 1
+                        update_collection_state(
+                            team,
+                            f"RSS:{rss_url}",
+                            next_page_token="",
+                            completed=1,
+                            page_delta=1,
+                            videos_delta=len(entries),
+                            inserted_delta=inserted,
+                            skipped_delta=skipped,
+                        )
+                        total_inserted += inserted
+                        total_skipped += skipped
+                        total_seen += len(entries)
+                        logs.append(f"✅ {team}: RSS {len(entries)}개 확인, 신규 {inserted}개, 중복 {skipped}개 / channel_id={channel_id}")
+                    except Exception as e:
+                        safe_error = sanitize_error_message(e, api_key)
+                        update_collection_state(team, f"RSS:{channel_value}", completed=0, last_error=safe_error)
+                        logs.append(f"⚠️ {team}: RSS 수집 실패 - {safe_error}")
+                    progress.progress(idx / max(len(tasks), 1))
+                    log_box.text("\n".join(logs[-18:]))
+
+                db_total = int(query_df("SELECT COUNT(*) AS cnt FROM songs").iloc[0]["cnt"])
+                st.success(f"RSS 수집 완료: 영상 {total_seen}개 확인, 신규 저장 {total_inserted}개, 중복 {total_skipped}개, 현재 DB 총 {db_total}개")
+
+    if collection_method == "YouTube API 채널 수집(쿼터 절약)":
+        st.markdown("### 📺 YouTube API 채널 수집")
+        st.caption("검색어로 넓게 찾는 대신, 지정된 채널의 업로드 목록을 가져옵니다. 검색 수집보다 쿼터를 훨씬 아끼고 공식 채널 중심 DB를 만들 때 좋습니다.")
+        auto_find_missing = st.checkbox("채널 URL이 없는 팀은 팀 이름으로 채널 1순위 자동 탐색", value=True)
+        save_auto_found = st.checkbox("자동 탐색한 채널 URL을 찬양팀 목록에 저장", value=True)
+        extra_channel_values = st.text_area(
+            "추가로 수집할 채널 ID/핸들/URL",
+            placeholder="UCmDCtLeqOzF7_uf_UXoNiYA\nhttps://www.youtube.com/@FIAWORSHIP",
+            height=90,
+        )
+
+        if st.button("선택한 찬양팀 YouTube API 채널 수집 시작", type="primary"):
+            if not api_key:
+                st.error("YouTube API 채널 수집은 YouTube Data API Key가 필요합니다. API 키 없이 하려면 채널 RSS 수집을 사용하세요.")
+                st.stop()
+
+            selected = sources[sources["team"].isin(selected_teams)]
+            tasks = []
+            task_source_rows = {}
+            for _, row in selected.iterrows():
+                team = str(row.get("team", ""))
+                urls = [x.strip() for x in str(row.get("channel_urls", "")).split("|") if x.strip()]
+                if urls:
+                    for channel_value in urls:
+                        tasks.append((team, channel_value, row))
+                elif auto_find_missing:
+                    tasks.append((team, f"AUTO_SEARCH::{team}", row))
+            for raw_value in [x.strip() for x in extra_channel_values.splitlines() if x.strip()]:
+                tasks.append(("직접 추가 채널", raw_value, {}))
+
+            if not tasks:
+                st.warning("수집할 채널이 없습니다. 채널 URL을 추가하거나 자동 탐색을 켜주세요.")
+            else:
+                total_inserted = 0
+                total_skipped = 0
+                total_videos = 0
+                total_pages = 0
+                progress = st.progress(0)
+                log_box = st.empty()
+                logs = []
+                stop_all_collection = False
+
+                for idx, (team, channel_value, source_row) in enumerate(tasks, start=1):
+                    try:
+                        found_by_search = False
+                        if channel_value.startswith("AUTO_SEARCH::"):
+                            candidates = youtube_channel_search(api_key, team, max_results=1)
+                            if not candidates:
+                                logs.append(f"⚠️ {team}: 채널 자동 탐색 실패 - 후보 없음")
+                                progress.progress(idx / max(len(tasks), 1))
+                                log_box.text("\n".join(logs[-18:]))
+                                continue
+                            channel_id = candidates[0]["channel_id"]
+                            channel_value = candidates[0]["channel_url"]
+                            found_by_search = True
+                            logs.append(f"🔎 {team}: 자동 발견 채널 - {candidates[0].get('title','')} / {channel_id}")
+                        else:
+                            channel_id = extract_youtube_channel_id(channel_value)
+
+                        if not channel_id:
+                            logs.append(f"⚠️ {team}: 채널 ID를 찾지 못했습니다 - {channel_value}")
+                            progress.progress(idx / max(len(tasks), 1))
+                            log_box.text("\n".join(logs[-18:]))
+                            continue
+
+                        if found_by_search and save_auto_found and team != "직접 추가 채널":
+                            existing_queries = str(source_row.get("search_queries", "")) if hasattr(source_row, "get") else ""
+                            existing_urls = str(source_row.get("channel_urls", "")) if hasattr(source_row, "get") else ""
+                            new_channel_url = f"https://www.youtube.com/channel/{channel_id}"
+                            merged_urls = existing_urls
+                            if new_channel_url not in merged_urls:
+                                merged_urls = (merged_urls + "|" + new_channel_url).strip("|") if merged_urls else new_channel_url
+                            try:
+                                add_or_update_source(team, existing_queries, merged_urls, str(source_row.get("notes", "자동 발견 채널 저장")) if hasattr(source_row, "get") else "자동 발견 채널 저장")
+                            except Exception:
+                                pass
+
+                        source_query = f"CHANNEL_API:{channel_id}"
+                        if reset_before_collect:
+                            reset_collection_state(team, source_query)
+                        state = get_collection_state(team, source_query) if resume_collection else {}
+                        if state.get("completed") and resume_collection:
+                            logs.append(f"⏭️ {team}: 채널 업로드 목록 이미 끝까지 수집 완료 / {channel_id}")
+                            progress.progress(idx / max(len(tasks), 1))
+                            log_box.text("\n".join(logs[-18:]))
+                            continue
+
+                        uploads_playlist_id = youtube_channel_uploads_playlist(api_key, channel_id)
+                        if not uploads_playlist_id:
+                            logs.append(f"⚠️ {team}: 업로드 플레이리스트를 찾지 못했습니다 / {channel_id}")
+                            continue
+
+                        page_token = state.get("next_page_token", "") if resume_collection else ""
+                        query_inserted = 0
+                        query_skipped = 0
+                        query_videos = 0
+                        query_pages = 0
+
+                        while True:
+                            page_json = youtube_playlist_items(api_key, uploads_playlist_id, page_token=page_token or None, max_results=50)
+                            query_pages += 1
+                            total_pages += 1
+                            items = page_json.get("items", [])
+                            page_inserted = 0
+                            page_skipped = 0
+                            for item in items:
+                                song = build_video_row_from_playlist_item(item, team=team, source_query=source_query)
+                                if not song:
+                                    page_skipped += 1
+                                    continue
+                                raw_title = song.get("raw_title", "")
+                                duration_sec = int(song.get("duration_seconds", 0) or 0)
+                                if should_exclude(raw_title, exclude_keywords, int(min_sec), int(max_sec), duration_sec):
+                                    page_skipped += 1
+                                    continue
+                                if upsert_song(song):
+                                    page_inserted += 1
+                                else:
+                                    page_skipped += 1
+
+                            query_videos += len(items)
+                            total_videos += len(items)
+                            query_inserted += page_inserted
+                            query_skipped += page_skipped
+                            total_inserted += page_inserted
+                            total_skipped += page_skipped
+
+                            next_page_token = page_json.get("nextPageToken", "") or ""
+                            completed = 0 if next_page_token else 1
+                            update_collection_state(
+                                team,
+                                source_query,
+                                next_page_token=next_page_token,
+                                completed=completed,
+                                page_delta=1,
+                                videos_delta=len(items),
+                                inserted_delta=page_inserted,
+                                skipped_delta=page_skipped,
+                            )
+
+                            logs.append(f"✅ {team}: 채널 {query_pages}페이지, 영상 {query_videos}개 확인, 신규 {query_inserted}개, 중복/제외 {query_skipped}개 / {channel_id}")
+                            progress.progress(min((idx - 1 + 0.5) / max(len(tasks), 1), 1.0))
+                            log_box.text("\n".join(logs[-18:]))
+
+                            if not next_page_token:
+                                break
+                            page_token = next_page_token
+
+                    except Exception as e:
+                        safe_error = sanitize_error_message(e, api_key)
+                        logs.append(f"⚠️ {team}: 채널 수집 중단 - {safe_error}")
+                        logs.append("   다음에 다시 실행하면 저장된 지점부터 이어서 수집할 수 있습니다.")
+                        if is_rate_limit_error(e):
+                            logs.append("   429/쿼터 제한으로 판단되어 남은 채널 수집도 여기서 멈춥니다.")
+                            stop_all_collection = True
+                    progress.progress(idx / max(len(tasks), 1))
+                    log_box.text("\n".join(logs[-18:]))
+                    if stop_all_collection:
+                        break
+
+                db_total = int(query_df("SELECT COUNT(*) AS cnt FROM songs").iloc[0]["cnt"])
+                st.success(f"채널 수집 완료: 채널 페이지 {total_pages}개, 영상 {total_videos}개 확인, 신규 저장 {total_inserted}개, 중복/제외 {total_skipped}개, 현재 DB 총 {db_total}개")
+
+    if collection_method == "CSV 가져오기":
+        st.markdown("### 📄 CSV 가져오기")
+        st.caption("컬럼 예시: clean_title, team, video_url, raw_title, channel_title, published_at, description. 영상 파일은 저장하지 않습니다.")
+        uploaded_csv = st.file_uploader("CSV 파일 업로드", type=["csv"])
+        if uploaded_csv is not None:
+            try:
+                import_df = pd.read_csv(uploaded_csv)
+                st.dataframe(import_df.head(50), use_container_width=True)
+                if st.button("CSV 내용을 DB에 저장"):
+                    inserted = 0
+                    skipped = 0
+                    for _, row in import_df.iterrows():
+                        url = str(row.get("video_url", "") or row.get("url", ""))
+                        video_id = extract_youtube_video_id(url)
+                        if not video_id:
+                            video_id = normalize_text(str(row.get("video_id", "")))
+                        if not video_id:
+                            skipped += 1
+                            continue
+                        raw_title = str(row.get("raw_title", "") or row.get("clean_title", "") or row.get("title", ""))
+                        team = str(row.get("team", "미확인") or "미확인")
+                        song = {
+                            "video_id": video_id,
+                            "source_video_id": video_id,
+                            "raw_title": raw_title,
+                            "clean_title": str(row.get("clean_title", "") or clean_video_title(raw_title, team)),
+                            "team": team,
+                            "channel_title": str(row.get("channel_title", "")),
+                            "video_url": url or video_url_with_start(video_id, None),
+                            "published_at": str(row.get("published_at", "")),
+                            "duration_iso": "",
+                            "duration_seconds": int(row.get("duration_seconds", 0) or 0),
+                            "description": str(row.get("description", "")),
+                            "speed": str(row.get("speed", "미확인") or "미확인"),
+                            "theme": str(row.get("theme", "미확인") or "미확인"),
+                            "source_query": "CSV 가져오기",
+                        }
+                        if upsert_song(song):
+                            inserted += 1
+                        else:
+                            skipped += 1
+                    st.success(f"CSV 저장 완료: 신규 {inserted}개, 중복/실패 {skipped}개")
+            except Exception as e:
+                st.error(f"CSV 처리 실패: {e}")
+
     st.divider()
-    st.subheader("🔗 유튜브 URL 직접 저장")
+    if collection_method == "직접 URL 저장":
+        st.subheader("🔗 유튜브 URL 직접 저장")
     st.caption("유튜브 영상 파일은 저장하지 않고 링크와 메타데이터만 저장합니다. 메들리 여부/포함 곡 수는 2번 NVIDIA AI 분석에서 처리합니다.")
     url_c1, url_c2 = st.columns([2, 1])
     with url_c1:
@@ -1505,151 +2095,154 @@ if menu == "1. DB 자동 수집":
 
     st.divider()
 
-    if st.button("선택한 찬양팀 전체 자동 수집 시작", type="primary"):
-        if not api_key:
-            st.error("YouTube Data API Key를 입력해주세요.")
-            st.stop()
+    if collection_method == "YouTube API 검색 수집(넓게 수집, 쿼터 많이 사용)":
+        st.markdown("### 🔎 YouTube API 검색 수집")
+        st.caption("검색어로 넓게 수집합니다. 가장 많은 후보를 찾을 수 있지만 search.list 쿼터를 많이 사용합니다.")
+        if st.button("선택한 찬양팀 전체 자동 수집 시작", type="primary"):
+            if not api_key:
+                st.error("YouTube Data API Key를 입력해주세요.")
+                st.stop()
 
-        selected = sources[sources["team"].isin(selected_teams)]
-        total_inserted = 0
-        total_skipped = 0
-        total_videos = 0
-        total_pages = 0
-        progress = st.progress(0)
-        log_box = st.empty()
-        logs = []
-        tasks = []
-        for _, row in selected.iterrows():
-            for q in str(row["search_queries"]).split("|"):
-                q = q.strip()
-                if q:
-                    tasks.append((row["team"], q))
+            selected = sources[sources["team"].isin(selected_teams)]
+            total_inserted = 0
+            total_skipped = 0
+            total_videos = 0
+            total_pages = 0
+            progress = st.progress(0)
+            log_box = st.empty()
+            logs = []
+            tasks = []
+            for _, row in selected.iterrows():
+                for q in str(row["search_queries"]).split("|"):
+                    q = q.strip()
+                    if q:
+                        tasks.append((row["team"], q))
 
-        stop_all_collection = False
-        for idx, (team, query) in enumerate(tasks, start=1):
-            if reset_before_collect:
-                reset_collection_state(team, query)
+            stop_all_collection = False
+            for idx, (team, query) in enumerate(tasks, start=1):
+                if reset_before_collect:
+                    reset_collection_state(team, query)
 
-            state = get_collection_state(team, query) if resume_collection else {}
-            if state.get("completed") and resume_collection:
-                logs.append(f"⏭️ {team} / {query}: 이미 끝까지 수집 완료")
+                state = get_collection_state(team, query) if resume_collection else {}
+                if state.get("completed") and resume_collection:
+                    logs.append(f"⏭️ {team} / {query}: 이미 끝까지 수집 완료")
+                    progress.progress(idx / max(len(tasks), 1))
+                    log_box.text("\n".join(logs[-18:]))
+                    continue
+
+                page_token = state.get("next_page_token", "") if resume_collection else ""
+                query_inserted = 0
+                query_skipped = 0
+                query_videos = 0
+                query_pages = 0
+
+                while True:
+                    try:
+                        search_json = youtube_search(api_key, query, max_results=50, page_token=page_token or None)
+                        query_pages += 1
+                        total_pages += 1
+                        search_items = search_json.get("items", [])
+                        video_ids = [item.get("id", {}).get("videoId") for item in search_items if item.get("id", {}).get("videoId")]
+                        query_videos += len(video_ids)
+                        total_videos += len(video_ids)
+
+                        details_by_id = {}
+                        details_warning = ""
+                        try:
+                            details_json = youtube_videos(api_key, video_ids)
+                            details_by_id = {item.get("id"): item for item in details_json.get("items", []) if item.get("id")}
+                        except Exception as detail_error:
+                            # If videos.list hits quota/rate limits after search.list succeeded, keep the search results.
+                            # This prevents the confusing case: "영상 N개 확인, 신규 저장 0개".
+                            details_warning = sanitize_error_message(detail_error, api_key)
+
+                        page_inserted = 0
+                        page_skipped = 0
+                        for search_item in search_items:
+                            video_id = search_item.get("id", {}).get("videoId") if isinstance(search_item.get("id", {}), dict) else ""
+                            if not video_id:
+                                page_skipped += 1
+                                continue
+
+                            detail_item = details_by_id.get(video_id)
+                            if detail_item:
+                                snippet = detail_item.get("snippet", {})
+                                content = detail_item.get("contentDetails", {})
+                                duration_sec = iso8601_duration_to_seconds(content.get("duration", ""))
+                                raw_title = snippet.get("title", "")
+                                song = build_video_row_from_item(item=detail_item, team=team, source_query=query)
+                            else:
+                                snippet = search_item.get("snippet", {})
+                                duration_sec = 0
+                                raw_title = snippet.get("title", "")
+                                song = build_video_row_from_search_item(search_item=search_item, team=team, source_query=query)
+
+                            if not song:
+                                page_skipped += 1
+                                continue
+                            if should_exclude(raw_title, exclude_keywords, int(min_sec), int(max_sec), duration_sec):
+                                page_skipped += 1
+                                continue
+
+                            if upsert_song(song):
+                                page_inserted += 1
+                            else:
+                                page_skipped += 1
+
+                        if details_warning:
+                            logs.append(f"⚠️ {team} / {query}: 영상 상세조회 실패, 검색 결과 기본정보만 저장 - {details_warning}")
+
+                        total_inserted += page_inserted
+                        total_skipped += page_skipped
+                        query_inserted += page_inserted
+                        query_skipped += page_skipped
+
+                        next_page_token = search_json.get("nextPageToken", "") or ""
+                        completed = 0 if next_page_token else 1
+                        update_collection_state(
+                            team,
+                            query,
+                            next_page_token=next_page_token,
+                            completed=completed,
+                            page_delta=1,
+                            videos_delta=len(video_ids),
+                            inserted_delta=page_inserted,
+                            skipped_delta=page_skipped,
+                        )
+
+                        logs.append(
+                            f"✅ {team} / {query}: {query_pages}페이지, 영상 {query_videos}개 확인, 신규 {query_inserted}개, 중복/제외 {query_skipped}개"
+                        )
+                        progress.progress(min((idx - 1 + 0.5) / max(len(tasks), 1), 1.0))
+                        log_box.text("\n".join(logs[-18:]))
+
+                        if not next_page_token:
+                            break
+                        page_token = next_page_token
+
+                    except Exception as e:
+                        safe_error = sanitize_error_message(e, api_key)
+                        update_collection_state(
+                            team,
+                            query,
+                            next_page_token=page_token or "",
+                            completed=0,
+                            last_error=safe_error,
+                        )
+                        logs.append(f"⚠️ {team} / {query}: 중단 - {safe_error}")
+                        logs.append("   다음에 다시 실행하면 저장된 지점부터 이어서 수집할 수 있습니다.")
+                        if is_rate_limit_error(e):
+                            logs.append("   429/쿼터 제한으로 판단되어 남은 검색어 수집도 여기서 멈춥니다.")
+                            stop_all_collection = True
+                        break
+
                 progress.progress(idx / max(len(tasks), 1))
                 log_box.text("\n".join(logs[-18:]))
-                continue
-
-            page_token = state.get("next_page_token", "") if resume_collection else ""
-            query_inserted = 0
-            query_skipped = 0
-            query_videos = 0
-            query_pages = 0
-
-            while True:
-                try:
-                    search_json = youtube_search(api_key, query, max_results=50, page_token=page_token or None)
-                    query_pages += 1
-                    total_pages += 1
-                    search_items = search_json.get("items", [])
-                    video_ids = [item.get("id", {}).get("videoId") for item in search_items if item.get("id", {}).get("videoId")]
-                    query_videos += len(video_ids)
-                    total_videos += len(video_ids)
-
-                    details_by_id = {}
-                    details_warning = ""
-                    try:
-                        details_json = youtube_videos(api_key, video_ids)
-                        details_by_id = {item.get("id"): item for item in details_json.get("items", []) if item.get("id")}
-                    except Exception as detail_error:
-                        # If videos.list hits quota/rate limits after search.list succeeded, keep the search results.
-                        # This prevents the confusing case: "영상 N개 확인, 신규 저장 0개".
-                        details_warning = sanitize_error_message(detail_error, api_key)
-
-                    page_inserted = 0
-                    page_skipped = 0
-                    for search_item in search_items:
-                        video_id = search_item.get("id", {}).get("videoId") if isinstance(search_item.get("id", {}), dict) else ""
-                        if not video_id:
-                            page_skipped += 1
-                            continue
-
-                        detail_item = details_by_id.get(video_id)
-                        if detail_item:
-                            snippet = detail_item.get("snippet", {})
-                            content = detail_item.get("contentDetails", {})
-                            duration_sec = iso8601_duration_to_seconds(content.get("duration", ""))
-                            raw_title = snippet.get("title", "")
-                            song = build_video_row_from_item(item=detail_item, team=team, source_query=query)
-                        else:
-                            snippet = search_item.get("snippet", {})
-                            duration_sec = 0
-                            raw_title = snippet.get("title", "")
-                            song = build_video_row_from_search_item(search_item=search_item, team=team, source_query=query)
-
-                        if not song:
-                            page_skipped += 1
-                            continue
-                        if should_exclude(raw_title, exclude_keywords, int(min_sec), int(max_sec), duration_sec):
-                            page_skipped += 1
-                            continue
-
-                        if upsert_song(song):
-                            page_inserted += 1
-                        else:
-                            page_skipped += 1
-
-                    if details_warning:
-                        logs.append(f"⚠️ {team} / {query}: 영상 상세조회 실패, 검색 결과 기본정보만 저장 - {details_warning}")
-
-                    total_inserted += page_inserted
-                    total_skipped += page_skipped
-                    query_inserted += page_inserted
-                    query_skipped += page_skipped
-
-                    next_page_token = search_json.get("nextPageToken", "") or ""
-                    completed = 0 if next_page_token else 1
-                    update_collection_state(
-                        team,
-                        query,
-                        next_page_token=next_page_token,
-                        completed=completed,
-                        page_delta=1,
-                        videos_delta=len(video_ids),
-                        inserted_delta=page_inserted,
-                        skipped_delta=page_skipped,
-                    )
-
-                    logs.append(
-                        f"✅ {team} / {query}: {query_pages}페이지, 영상 {query_videos}개 확인, 신규 {query_inserted}개, 중복/제외 {query_skipped}개"
-                    )
-                    progress.progress(min((idx - 1 + 0.5) / max(len(tasks), 1), 1.0))
-                    log_box.text("\n".join(logs[-18:]))
-
-                    if not next_page_token:
-                        break
-                    page_token = next_page_token
-
-                except Exception as e:
-                    safe_error = sanitize_error_message(e, api_key)
-                    update_collection_state(
-                        team,
-                        query,
-                        next_page_token=page_token or "",
-                        completed=0,
-                        last_error=safe_error,
-                    )
-                    logs.append(f"⚠️ {team} / {query}: 중단 - {safe_error}")
-                    logs.append("   다음에 다시 실행하면 저장된 지점부터 이어서 수집할 수 있습니다.")
-                    if is_rate_limit_error(e):
-                        logs.append("   429/쿼터 제한으로 판단되어 남은 검색어 수집도 여기서 멈춥니다.")
-                        stop_all_collection = True
+                if 'stop_all_collection' in locals() and stop_all_collection:
                     break
 
-            progress.progress(idx / max(len(tasks), 1))
-            log_box.text("\n".join(logs[-18:]))
-            if 'stop_all_collection' in locals() and stop_all_collection:
-                break
-
-        db_total = int(query_df("SELECT COUNT(*) AS cnt FROM songs").iloc[0]["cnt"])
-        st.success(f"전체 수집 실행 완료: 검색 페이지 {total_pages}개, 영상 {total_videos}개 확인, 신규 저장 {total_inserted}개, 중복/제외 {total_skipped}개, 현재 DB 총 {db_total}개")
+            db_total = int(query_df("SELECT COUNT(*) AS cnt FROM songs").iloc[0]["cnt"])
+            st.success(f"전체 수집 실행 완료: 검색 페이지 {total_pages}개, 영상 {total_videos}개 확인, 신규 저장 {total_inserted}개, 중복/제외 {total_skipped}개, 현재 DB 총 {db_total}개")
 
     st.divider()
     st.subheader("최근 수집된 곡")
