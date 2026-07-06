@@ -19,6 +19,34 @@ APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "worship_songs.db"
 SOURCES_PATH = APP_DIR / "worship_sources.csv"
 
+
+# 기본 찬양팀 채널 URL. worship_sources.csv가 오래된 버전이라 channel_urls가 비어 있어도
+# 앱 실행 시 자동으로 보강합니다. 여러 채널은 | 로 구분합니다.
+DEFAULT_CHANNEL_URLS = {
+    "어노이팅": "https://www.youtube.com/channel/UCqZ6R9Js2HG-6ZNP71soeUg",
+    "마커스워십": "https://www.youtube.com/channel/UCrnxDS-QclED-ej-MFxr8tA",
+    "피아워십": "https://www.youtube.com/channel/UCmDCtLeqOzF7_uf_UXoNiYA",
+    "나비워십": "https://www.youtube.com/@naviworship",
+    "브리지임팩트": "https://www.youtube.com/channel/UCZQNzBSxTPjsQgZLfOb-Akg|https://www.youtube.com/@bridgeimpact_praise",
+    "청춘찬양단": "https://www.youtube.com/channel/UCOtwvClqA-WPVmd6kstVAEg",
+    "제이어스": "https://www.youtube.com/channel/UCvD9bnpjlzv2gVA_cQ1ESNg",
+    "위러브": "https://www.youtube.com/channel/UCP7ZxuXP4w6TODC_np5Q_IA",
+    "아이자야씩스티원": "https://www.youtube.com/channel/UCCJMY5J7tSmopE6kuRNs1Zw",
+    "예람워십": "https://www.youtube.com/channel/UCWgyCh92781HaX_ue0r8Vng|https://www.youtube.com/channel/UCvm6a01Xd4A3BmComXLuMgg",
+    "팀룩워십": "https://www.youtube.com/channel/UCs8bogrlfyKhAOTywkR9o6w|https://www.youtube.com/@teamlukeworship",
+    "레위지파": "https://www.youtube.com/channel/UCAbODSDSnpLDq_XRIAukpOg",
+    "예수전도단 화요모임": "https://www.youtube.com/channel/UCn5qdSP9lz6BIl4bPwM41qg|https://www.youtube.com/channel/UCMF3UdMjZ0qIYfMlrBhXo5A",
+    "뉴제너레이션워십": "https://www.youtube.com/channel/UCsBpGALUyAUY3qJZdenPgTA|https://www.youtube.com/channel/UCV-ifjSDkRQXqeEE-tJ2A3Q",
+    "홀리임팩트": "https://www.youtube.com/channel/UCvF7uARkFRXpcqmghQf6szA",
+    "다윗의장막": "https://www.youtube.com/channel/UCZagAKqkS-DazyK5IFoTlHA|https://www.youtube.com/channel/UCmPoEZEeBcQPfz5yIIR0SMQ|https://www.youtube.com/channel/UCaTL5Hq8WdrGKibZ0qNY-LA",
+    "한성교회": "https://www.youtube.com/channel/UCEo0Y1O0As5iKBAC771mkIQ|https://www.youtube.com/channel/UCvJNTgqO-X70DiOWhx8dt2Q|https://www.youtube.com/channel/UC1C0KVr0Rixdpf-TWfcuWtw",
+    "온누리워십": "https://www.youtube.com/channel/UCtncl8sHRF-w2cX1x51jSEA|https://www.youtube.com/channel/UCnLOIRt9ml4YDZGjHnPSvVg",
+    "분당우리교회": "https://www.youtube.com/@woorichurch|https://www.youtube.com/@woorichurchworship",
+    "지구촌교회": "https://www.youtube.com/channel/UCBZb1WwKAjTP8HseLRlksoQ|https://www.youtube.com/channel/UCA5G-2tR2WGB5CQKNllW2gA|https://www.youtube.com/channel/UCZP1m1mQHyZgdRyLDTvLRqA|https://www.youtube.com/channel/UCUTS7_mnFAJI3g-sKZVS0Jg",
+    "만나교회": "https://www.youtube.com/channel/UCF562uDvgi9B5cXpp5QBVjg|https://www.youtube.com/channel/UC0EweXMQqvbiTPYLXY0WFzA|https://www.youtube.com/channel/UCXCO1FVeIot8LFUadCc18qw",
+    "아가파오 워십": "https://www.youtube.com/channel/UCTYIVJxDmGCfGr-Poi617_g|https://www.youtube.com/channel/UCVG-20zhW75ieBd7SB3jlBw|https://www.youtube.com/channel/UCkX-9IT18Nn4kIO09caRnTA",
+}
+
 DEFAULT_EXCLUDE_KEYWORDS = [
     "커버", "cover", "COVER", "1시간", "2시간",
     "광고없는 플레이리스트", "MR", "mr", "반주", "악보", "강의", "tutorial", "drum", "guitar",
@@ -728,13 +756,23 @@ def should_exclude(title: str, exclude_keywords: Sequence[str], min_sec: int, ma
 
 def load_sources() -> pd.DataFrame:
     if not SOURCES_PATH.exists():
-        return pd.DataFrame(columns=["team", "search_queries", "channel_urls", "notes"])
-    df = pd.read_csv(SOURCES_PATH)
-    df = df.dropna(how="all")
-    # Older versions had only team/search_queries/notes. Channel URLs are optional.
+        df = pd.DataFrame(columns=["team", "search_queries", "channel_urls", "notes"])
+    else:
+        df = pd.read_csv(SOURCES_PATH)
+        df = df.dropna(how="all")
+    # Older versions had only team/search_queries/notes. Channel URLs are optional,
+    # so fill defaults automatically when they are missing.
     for col in ["team", "search_queries", "channel_urls", "notes"]:
         if col not in df.columns:
             df[col] = ""
+    for idx, row in df.iterrows():
+        team = normalize_text(str(row.get("team", "")))
+        current_urls = normalize_text(str(row.get("channel_urls", "")))
+        if (not current_urls or current_urls.lower() == "nan") and team in DEFAULT_CHANNEL_URLS:
+            df.at[idx, "channel_urls"] = DEFAULT_CHANNEL_URLS[team]
+            note = normalize_text(str(row.get("notes", "")))
+            if "채널 URL 자동 보강" not in note:
+                df.at[idx, "notes"] = (note + " / 채널 URL 자동 보강").strip(" /")
     return df[["team", "search_queries", "channel_urls", "notes"]].copy()
 
 

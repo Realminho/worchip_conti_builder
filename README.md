@@ -227,3 +227,10 @@ video_url = 원본 유튜브 링크
 - `/user/BridgeImpact` 같은 구형 YouTube 주소는 RSS의 `user=` 형식으로 변환되도록 코드를 보완했습니다.
 
 RSS 수집이 실패할 때는 먼저 `worship_sources.csv`의 `channel_urls` 값이 비어 있지 않은지 확인하세요. 채널 ID가 들어 있는 주소는 가장 안정적으로 동작합니다.
+
+## 2026-07-06 채널 URL 보강 업데이트
+
+- 기본 찬양팀의 `channel_urls` 컬럼을 채웠습니다.
+- 기존 `worship_sources.csv`가 오래되어 `channel_urls`가 비어 있어도, 앱 실행 시 `DEFAULT_CHANNEL_URLS` 값으로 자동 보강되도록 `app.py`도 수정했습니다.
+- 여러 채널이 필요한 팀은 `|` 구분자로 여러 URL을 넣었습니다. 예: `채널1|채널2`.
+- RSS 수집은 `/channel/UC...` 형식의 직접 채널 URL을 우선 사용합니다. 일부 핸들 URL은 앱이 내부적으로 채널 ID를 찾아 RSS 주소로 변환합니다.
