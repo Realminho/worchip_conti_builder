@@ -532,13 +532,36 @@ def extract_youtube_channel_id(value: str) -> str:
 
 
 def youtube_rss_url_from_channel_input(channel_value: str) -> Tuple[str, str]:
-    """Return (rss_url, channel_id) from channel id/handle/channel URL/RSS URL."""
+    """Return (rss_url, channel_id_or_user) from channel id/handle/channel URL/RSS URL.
+
+    YouTube exposes RSS in two useful forms:
+    - https://www.youtube.com/feeds/videos.xml?channel_id=UC...
+    - https://www.youtube.com/feeds/videos.xml?user=legacyUserName
+
+    A /channel/UC... URL can be converted without any network request.
+    A legacy /user/... URL can also be converted without any network request.
+    @handle and /c/custom URLs still require resolving the page, so default sources
+    prefer direct /channel/UC... IDs whenever possible.
+    """
     channel_value = normalize_text(channel_value)
     if not channel_value:
         return "", ""
-    if "feeds/videos.xml" in channel_value and "channel_id=" in channel_value:
-        channel_id = extract_youtube_channel_id(channel_value)
-        return channel_value, channel_id
+
+    # Already an RSS URL. Accept both channel_id and legacy user feeds.
+    if "feeds/videos.xml" in channel_value:
+        if "channel_id=" in channel_value:
+            channel_id = extract_youtube_channel_id(channel_value)
+            return channel_value, channel_id
+        m_user = re.search(r"[?&]user=([^&\s]+)", channel_value)
+        if m_user:
+            return channel_value, m_user.group(1)
+
+    # Legacy /user/ URLs can use RSS directly. This avoids fragile @handle page parsing.
+    m_user = re.search(r"youtube\.com/user/([^/?&#]+)", channel_value)
+    if m_user:
+        user_name = m_user.group(1)
+        return f"https://www.youtube.com/feeds/videos.xml?user={user_name}", user_name
+
     channel_id = extract_youtube_channel_id(channel_value)
     if not channel_id:
         return "", ""
