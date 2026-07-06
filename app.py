@@ -1,6 +1,7 @@
 import itertools
 import json
 import math
+import time
 import os
 import re
 import sqlite3
@@ -81,6 +82,21 @@ def get_app_secret(root_key: str, nested_section: str, nested_key: str, env_key:
 
 def secret_status_label(value: str) -> str:
     return "✅ secrets.toml에서 불러옴" if value else "⚠️ secrets.toml에 없음"
+
+
+def sanitize_error_message(error: Exception | str, api_key: str = "") -> str:
+    """Hide API keys from error messages before showing them in Streamlit logs."""
+    text = str(error)
+    if api_key:
+        text = text.replace(api_key, "[API_KEY_HIDDEN]")
+    text = re.sub(r"([?&]key=)[^&\s]+", r"\1[API_KEY_HIDDEN]", text)
+    text = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1[API_KEY_HIDDEN]", text)
+    return text
+
+
+def is_rate_limit_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    return "429" in text or "too many requests" in text or "quota" in text or "rate limit" in text
 
 # -----------------------------
 # DB
@@ -926,6 +942,43 @@ def build_video_row_from_item(item: Dict, team: str, source_query: str) -> Dict:
     }
 
 
+def build_video_row_from_search_item(search_item: Dict, team: str, source_query: str) -> Optional[Dict]:
+    """Fallback storage from search.list results when videos.list is unavailable or rate-limited.
+
+    This still stores only the YouTube URL and basic metadata. Duration remains 0 until a later refresh/analyze step.
+    """
+    raw_id = search_item.get("id", {})
+    source_video_id = raw_id.get("videoId") if isinstance(raw_id, dict) else raw_id
+    if not source_video_id:
+        return None
+    snippet = search_item.get("snippet", {})
+    raw_title = snippet.get("title", "")
+    return {
+        "video_id": source_video_id,
+        "source_video_id": source_video_id,
+        "song_index": 1,
+        "segment_label": "",
+        "segment_start_seconds": None,
+        "raw_title": raw_title,
+        "clean_title": clean_video_title(raw_title, team),
+        "team": team,
+        "channel_title": snippet.get("channelTitle", ""),
+        "video_url": video_url_with_start(source_video_id, None),
+        "published_at": snippet.get("publishedAt", ""),
+        "duration_iso": "",
+        "duration_seconds": 0,
+        "description": snippet.get("description", ""),
+        "speed": "미확인",
+        "theme": "미확인",
+        "is_medley": 0,
+        "medley_song_count": 1,
+        "medley_songs": "",
+        "ai_analyzed": 0,
+        "ai_note": "YouTube search 결과에서 우선 저장됨. 상세 길이 정보는 나중에 보강 가능.",
+        "source_query": source_query,
+    }
+
+
 def normalize_medley_songs(value) -> List[str]:
     """Return a clean list of song titles from AI output or existing DB text."""
     if value is None:
@@ -1301,19 +1354,10 @@ def generate_section_sequences(candidates: List[Dict], count: int, connected: bo
 
     return sorted(unique.values(), key=lambda x: x[0], reverse=True)[:20]
 
-def build_contis(section_results: List[List[Tuple[int, List[Dict], str]]], top_n: int = 7) -> List[Dict]:
-    """Build several full setlist candidates from section-level candidates.
-
-    The user should be able to compare multiple complete conti sets, not just
-    receive one answer. We therefore keep more combinations, remove exact
-    duplicates, and then return the highest-scoring `top_n` options.
-    """
+def build_contis(section_results: List[List[Tuple[int, List[Dict], str]]], top_n: int = 3) -> List[Dict]:
     if any(not r for r in section_results):
         return []
     contis = []
-    seen = set()
-    max_combinations_to_keep = max(1000, int(top_n) * 250)
-
     for combo in itertools.product(*section_results):
         used_ids = []
         songs = []
@@ -1333,68 +1377,10 @@ def build_contis(section_results: List[List[Tuple[int, List[Dict], str]]], top_n
                 break
         if duplicate:
             continue
-
-        signature = tuple((s.get("id"), selected_song_count_value(s)) for s in songs)
-        if signature in seen:
-            continue
-        seen.add(signature)
-
         contis.append({"score": score, "songs": songs, "reasons": "\n\n".join(reasons)})
-        if len(contis) >= max_combinations_to_keep:
+        if len(contis) > 500:
             break
-
     return sorted(contis, key=lambda x: x["score"], reverse=True)[:top_n]
-
-
-def conti_output_rows(conti: Dict) -> Tuple[List[Dict], int]:
-    """Convert a conti candidate into rows for table/link display."""
-    out_rows = []
-    current_order = 1
-    total_song_count = 0
-    for s in conti["songs"]:
-        selected_count = selected_song_count_value(s)
-        full_count = song_count_value(s)
-        order_label = str(current_order) if selected_count == 1 else f"{current_order}~{current_order + selected_count - 1}"
-        selected_medley = s.get("_selected_medley_songs") or []
-        note = ""
-        if full_count > selected_count:
-            note = f"전체 메들리 {full_count}곡 중 {selected_count}곡만 사용"
-        elif full_count > 1:
-            note = f"메들리 {selected_count}곡 전체 사용"
-        out_rows.append(
-            {
-                "순서": order_label,
-                "곡 수": selected_count,
-                "곡명/사용 구간": conti_title_for_item(s),
-                "원본 DB 제목": s.get("clean_title"),
-                "찬양팀": s.get("team"),
-                "빠르기": s.get("speed"),
-                "키": s.get("song_key"),
-                "BPM": s.get("bpm"),
-                "첫 코드": s.get("first_chord"),
-                "마지막 코드": s.get("last_chord"),
-                "주제": s.get("theme"),
-                "메들리 포함 곡": ", ".join(selected_medley),
-                "비고": note,
-                "유튜브 링크": s.get("video_url"),
-            }
-        )
-        current_order += selected_count
-        total_song_count += selected_count
-    return out_rows, total_song_count
-
-
-def conti_copy_text(out_rows: List[Dict], score: int) -> str:
-    """Plain text version that can be copied into KakaoTalk/Notion/etc."""
-    lines = [f"추천 콘티 / 점수 {score}", ""]
-    for row in out_rows:
-        line = f"{row['순서']}. {row['곡명/사용 구간']} - {row['찬양팀']} / {row['빠르기']} / {row['키']} / BPM {row['BPM']}"
-        if row.get("비고"):
-            line += f" ({row['비고']})"
-        lines.append(line)
-        if row.get("유튜브 링크"):
-            lines.append(f"   {row['유튜브 링크']}")
-    return "\n".join(lines)
 
 # -----------------------------
 # UI
@@ -1515,7 +1501,7 @@ if menu == "1. DB 자동 수집":
             st.success(f"저장 완료: 신규 {inserted}개, 중복 {skipped}개")
             st.dataframe(pd.DataFrame([song])[["clean_title", "team", "video_url", "duration_seconds"]], use_container_width=True)
         except Exception as e:
-            st.error(f"URL 저장 실패: {e}")
+            st.error(f"URL 저장 실패: {sanitize_error_message(e, api_key)}")
 
     st.divider()
 
@@ -1539,6 +1525,7 @@ if menu == "1. DB 자동 수집":
                 if q:
                     tasks.append((row["team"], q))
 
+        stop_all_collection = False
         for idx, (team, query) in enumerate(tasks, start=1):
             if reset_before_collect:
                 reset_collection_state(team, query)
@@ -1561,27 +1548,56 @@ if menu == "1. DB 자동 수집":
                     search_json = youtube_search(api_key, query, max_results=50, page_token=page_token or None)
                     query_pages += 1
                     total_pages += 1
-                    video_ids = [item["id"].get("videoId") for item in search_json.get("items", []) if item.get("id", {}).get("videoId")]
+                    search_items = search_json.get("items", [])
+                    video_ids = [item.get("id", {}).get("videoId") for item in search_items if item.get("id", {}).get("videoId")]
                     query_videos += len(video_ids)
                     total_videos += len(video_ids)
-                    details_json = youtube_videos(api_key, video_ids)
+
+                    details_by_id = {}
+                    details_warning = ""
+                    try:
+                        details_json = youtube_videos(api_key, video_ids)
+                        details_by_id = {item.get("id"): item for item in details_json.get("items", []) if item.get("id")}
+                    except Exception as detail_error:
+                        # If videos.list hits quota/rate limits after search.list succeeded, keep the search results.
+                        # This prevents the confusing case: "영상 N개 확인, 신규 저장 0개".
+                        details_warning = sanitize_error_message(detail_error, api_key)
 
                     page_inserted = 0
                     page_skipped = 0
-                    for item in details_json.get("items", []):
-                        snippet = item.get("snippet", {})
-                        content = item.get("contentDetails", {})
-                        duration_sec = iso8601_duration_to_seconds(content.get("duration", ""))
-                        raw_title = snippet.get("title", "")
+                    for search_item in search_items:
+                        video_id = search_item.get("id", {}).get("videoId") if isinstance(search_item.get("id", {}), dict) else ""
+                        if not video_id:
+                            page_skipped += 1
+                            continue
+
+                        detail_item = details_by_id.get(video_id)
+                        if detail_item:
+                            snippet = detail_item.get("snippet", {})
+                            content = detail_item.get("contentDetails", {})
+                            duration_sec = iso8601_duration_to_seconds(content.get("duration", ""))
+                            raw_title = snippet.get("title", "")
+                            song = build_video_row_from_item(item=detail_item, team=team, source_query=query)
+                        else:
+                            snippet = search_item.get("snippet", {})
+                            duration_sec = 0
+                            raw_title = snippet.get("title", "")
+                            song = build_video_row_from_search_item(search_item=search_item, team=team, source_query=query)
+
+                        if not song:
+                            page_skipped += 1
+                            continue
                         if should_exclude(raw_title, exclude_keywords, int(min_sec), int(max_sec), duration_sec):
                             page_skipped += 1
                             continue
 
-                        song = build_video_row_from_item(item=item, team=team, source_query=query)
                         if upsert_song(song):
                             page_inserted += 1
                         else:
                             page_skipped += 1
+
+                    if details_warning:
+                        logs.append(f"⚠️ {team} / {query}: 영상 상세조회 실패, 검색 결과 기본정보만 저장 - {details_warning}")
 
                     total_inserted += page_inserted
                     total_skipped += page_skipped
@@ -1612,21 +1628,28 @@ if menu == "1. DB 자동 수집":
                     page_token = next_page_token
 
                 except Exception as e:
+                    safe_error = sanitize_error_message(e, api_key)
                     update_collection_state(
                         team,
                         query,
                         next_page_token=page_token or "",
                         completed=0,
-                        last_error=str(e),
+                        last_error=safe_error,
                     )
-                    logs.append(f"⚠️ {team} / {query}: 중단 - {e}")
+                    logs.append(f"⚠️ {team} / {query}: 중단 - {safe_error}")
                     logs.append("   다음에 다시 실행하면 저장된 지점부터 이어서 수집할 수 있습니다.")
+                    if is_rate_limit_error(e):
+                        logs.append("   429/쿼터 제한으로 판단되어 남은 검색어 수집도 여기서 멈춥니다.")
+                        stop_all_collection = True
                     break
 
             progress.progress(idx / max(len(tasks), 1))
             log_box.text("\n".join(logs[-18:]))
+            if 'stop_all_collection' in locals() and stop_all_collection:
+                break
 
-        st.success(f"전체 수집 실행 완료: 검색 페이지 {total_pages}개, 영상 {total_videos}개 확인, 신규 저장 {total_inserted}개, 중복/제외 {total_skipped}개")
+        db_total = int(query_df("SELECT COUNT(*) AS cnt FROM songs").iloc[0]["cnt"])
+        st.success(f"전체 수집 실행 완료: 검색 페이지 {total_pages}개, 영상 {total_videos}개 확인, 신규 저장 {total_inserted}개, 중복/제외 {total_skipped}개, 현재 DB 총 {db_total}개")
 
     st.divider()
     st.subheader("최근 수집된 곡")
@@ -1713,7 +1736,7 @@ elif menu == "2. NVIDIA AI 분석":
                 medley_label = f"메들리 {result.get('medley_song_count')}곡" if result.get("is_medley") else "단일곡"
                 logs.append(f"✅ {row['id']} / {result.get('clean_title')} / {medley_label}")
             except Exception as e:
-                logs.append(f"⚠️ {row.get('id')} 분석 중단: {e}")
+                logs.append(f"⚠️ {row.get('id')} 분석 중단: {sanitize_error_message(e, nvidia_api_key)}")
                 logs.append("   지금까지 완료된 항목은 저장됐습니다. 나중에 다시 실행하면 이어서 분석할 수 있습니다.")
                 stopped = True
                 break
@@ -1740,7 +1763,7 @@ elif menu == "2. NVIDIA AI 분석":
         st.dataframe(analyzed_df.drop(columns=["medley_songs"]), use_container_width=True)
 
 elif menu == "3. 곡 검수":
-    st.subheader("2. 곡 검수")
+    st.subheader("3. 곡 검수")
     st.write("자동 수집된 곡은 미확인 상태입니다. 예배에서 실제 사용할 키, BPM, 첫 코드, 마지막 코드, 악보 링크를 입력하고 검수 완료로 저장하세요.")
 
     filter_col1, filter_col2, filter_col3 = st.columns(3)
@@ -1851,7 +1874,7 @@ elif menu == "3. 곡 검수":
             st.success("저장했습니다. 화면을 새로고침하면 반영됩니다.")
 
 elif menu == "4. 콘티 추천":
-    st.subheader("3. 검수 완료 곡으로 콘티 추천")
+    st.subheader("4. 검수 완료 곡으로 콘티 추천")
     checked_df = query_df(
         """
         SELECT * FROM songs
@@ -1871,18 +1894,13 @@ elif menu == "4. 콘티 추천":
     with col1:
         allowed_keys = st.multiselect("사용 가능한 키", [k for k in KEY_OPTIONS if k != "미확인"], default=[])
     with col2:
-        preferred_teams = st.multiselect(
-            "참고할 찬양팀",
-            team_options,
-            default=team_options,
-            help="기본값은 전체 찬양팀입니다. 특정 팀만 참고하고 싶을 때만 줄이면 됩니다.",
-        )
+        preferred_teams = st.multiselect("참고할 찬양팀", team_options, default=team_options[: min(8, len(team_options))])
     with col3:
-        max_per_section = st.number_input("구간별 후보 최대 개수", min_value=10, max_value=100, value=45, step=5)
+        max_per_section = st.number_input("구간별 후보 최대 개수", min_value=10, max_value=80, value=35, step=5)
     with col4:
-        desired_conti_count = st.number_input("추천 세트 개수", min_value=1, max_value=20, value=7, step=1)
+        recommendation_count = st.number_input("추천 세트 개수", min_value=1, max_value=20, value=7, step=1)
 
-    use_ai_conti_note = st.checkbox("NVIDIA AI로 선택 콘티 흐름 설명 생성", value=False, help="여러 세트 중 선택한 콘티 1개에 대해서만 흐름 설명을 생성합니다.")
+    use_ai_conti_note = st.checkbox("NVIDIA AI로 콘티 흐름 설명 생성", value=False, help="추천 결과가 나온 뒤 구간별 분위기와 연결 이유를 자연어로 정리합니다.")
 
     st.markdown("### 콘티 구간 설정")
     st.caption("예: 앞부분 느린곡 3곡은 은혜/임재/회복, 중간 빠른곡 3곡은 기쁨/감사/선포, 마지막 느린곡 1곡은 결단/기도")
@@ -1918,13 +1936,12 @@ elif menu == "4. 콘티 추천":
         mood_text = st.text_input(f"구간 {i+1} 분위기 설명", value=default_mood, key=f"sec_mood_{i}")
         sections.append({"speed": speed, "count": int(count), "connected": connected, "themes": selected_themes, "mood": mood_text})
 
-    if st.button("콘티 여러 세트 추천 생성", type="primary"):
+    if st.button("콘티 추천 생성", type="primary"):
         rows = checked_df.to_dict("records")
         if preferred_teams:
             rows = [r for r in rows if r.get("team") in preferred_teams]
 
         section_results = []
-        section_status = []
         for sec in sections:
             candidates = []
             for r in rows:
@@ -1950,94 +1967,84 @@ elif menu == "4. 콘티 추천":
             sequences = generate_section_sequences(candidates, sec["count"], sec["connected"], max_candidates=int(max_per_section))
             section_results.append(sequences)
             theme_label = ", ".join(sec.get("themes") or ["전체"])
-            section_status.append({"후보곡": len(candidates), "조합": len(sequences), "분위기": theme_label})
+            st.write(f"구간 {len(section_results)} 후보곡 {len(candidates)}개 / 조합 {len(sequences)}개 / 분위기: {theme_label}")
 
-        contis = build_contis(section_results, top_n=int(desired_conti_count))
-        st.session_state["last_contis"] = contis
-        st.session_state["last_sections"] = sections
-        st.session_state["last_section_status"] = section_status
-        st.session_state["last_desired_conti_count"] = int(desired_conti_count)
-
-    contis = st.session_state.get("last_contis", [])
-    section_status = st.session_state.get("last_section_status", [])
-
-    if section_status:
-        st.markdown("### 구간별 후보 현황")
-        for idx, status in enumerate(section_status, start=1):
-            st.write(f"구간 {idx}: 후보곡 {status['후보곡']}개 / 조합 {status['조합']}개 / 분위기: {status['분위기']}")
-
-    if "last_contis" in st.session_state:
+        contis = build_contis(section_results, top_n=int(recommendation_count))
         if not contis:
             st.error("조건에 맞는 콘티를 만들 수 없습니다. 검수 완료 곡 수를 늘리거나 키/주제/찬양팀 조건을 줄여보세요.")
         else:
-            st.success(f"총 {len(contis)}개의 콘티 세트를 추천했습니다. 아래에서 마음에 드는 세트를 고르면 됩니다.")
-            labels = []
             for idx, conti in enumerate(contis, start=1):
-                out_rows, total_song_count = conti_output_rows(conti)
-                first_titles = " / ".join([r["곡명/사용 구간"] for r in out_rows[:2]])
-                labels.append(f"{idx}안 · 점수 {conti['score']} · {total_song_count}곡 · {first_titles}")
+                st.markdown(f"## 추천 콘티 {idx}안 — 점수 {conti['score']}")
+                out_rows = []
+                current_order = 1
+                total_song_count = 0
+                for s in conti["songs"]:
+                    selected_count = selected_song_count_value(s)
+                    full_count = song_count_value(s)
+                    order_label = str(current_order) if selected_count == 1 else f"{current_order}~{current_order + selected_count - 1}"
+                    selected_medley = s.get("_selected_medley_songs") or []
+                    note = ""
+                    if full_count > selected_count:
+                        note = f"전체 메들리 {full_count}곡 중 {selected_count}곡만 사용"
+                    elif full_count > 1:
+                        note = f"메들리 {selected_count}곡 전체 사용"
+                    out_rows.append(
+                        {
+                            "순서": order_label,
+                            "곡 수": selected_count,
+                            "곡명/사용 구간": conti_title_for_item(s),
+                            "원본 DB 제목": s.get("clean_title"),
+                            "찬양팀": s.get("team"),
+                            "빠르기": s.get("speed"),
+                            "키": s.get("song_key"),
+                            "BPM": s.get("bpm"),
+                            "첫 코드": s.get("first_chord"),
+                            "마지막 코드": s.get("last_chord"),
+                            "주제": s.get("theme"),
+                            "메들리 포함 곡": ", ".join(selected_medley),
+                            "비고": note,
+                            "유튜브 링크": s.get("video_url"),
+                        }
+                    )
+                    current_order += selected_count
+                    total_song_count += selected_count
+                result_df = pd.DataFrame(out_rows)
+                st.caption(f"이 콘티의 실제 곡 수 합계: {total_song_count}곡")
+                st.dataframe(result_df, use_container_width=True)
+                st.markdown("#### 순서 + 유튜브 링크")
+                for row in out_rows:
+                    st.markdown(f"{row['순서']}. **{row['곡명/사용 구간']}** - {row['찬양팀']} / {row['빠르기']} / {row['키']} / BPM {row['BPM']} / [{row['유튜브 링크']}]({row['유튜브 링크']})")
+                    if row.get("비고"):
+                        st.caption(row["비고"])
 
-            selected_idx = st.radio(
-                "최종으로 확인할 콘티 세트",
-                list(range(len(contis))),
-                format_func=lambda i: labels[i],
-                horizontal=False,
-            )
-            show_all_sets = st.checkbox("전체 추천 세트도 아래에 모두 펼쳐서 보기", value=False)
+                with st.expander("연결 이유 보기"):
+                    st.text(conti["reasons"])
 
-            def render_conti(idx: int, conti: Dict, expanded: bool = True) -> None:
-                out_rows, total_song_count = conti_output_rows(conti)
-                title = f"추천 콘티 {idx + 1}안 — 점수 {conti['score']} / 실제 {total_song_count}곡"
-                with st.expander(title, expanded=expanded):
-                    result_df = pd.DataFrame(out_rows)
-                    st.dataframe(result_df, use_container_width=True)
-                    st.markdown("#### 순서 + 유튜브 링크")
-                    for row in out_rows:
-                        link = row.get("유튜브 링크") or ""
-                        if link:
-                            st.markdown(f"{row['순서']}. **{row['곡명/사용 구간']}** - {row['찬양팀']} / {row['빠르기']} / {row['키']} / BPM {row['BPM']} / [유튜브 열기]({link})")
-                        else:
-                            st.markdown(f"{row['순서']}. **{row['곡명/사용 구간']}** - {row['찬양팀']} / {row['빠르기']} / {row['키']} / BPM {row['BPM']}")
-                        if row.get("비고"):
-                            st.caption(row["비고"])
-                    st.text_area("복사용 콘티", conti_copy_text(out_rows, conti["score"]), height=220, key=f"copy_conti_{idx}")
-                    with st.expander("연결 이유 보기"):
-                        st.text(conti["reasons"])
-                    if idx == selected_idx and use_ai_conti_note and nvidia_api_key:
-                        try:
-                            prompt = {
-                                "sections": st.session_state.get("last_sections", sections),
-                                "songs": out_rows,
-                                "connection_reasons": conti["reasons"],
-                            }
-                            ai_text = nvidia_chat_completion(
-                                api_key=nvidia_api_key,
-                                base_url=nvidia_base_url,
-                                model=nvidia_model,
-                                messages=[
-                                    {"role": "system", "content": "너는 교회 찬양단 콘티를 돕는 예배 음악 코치야. 과장하지 말고 실제 인도자가 이해하기 쉽게 설명해."},
-                                    {"role": "user", "content": "다음 콘티를 구간별 분위기, 곡 연결 방식, 인도 팁 중심으로 한국어로 짧게 정리해줘.\n" + json.dumps(prompt, ensure_ascii=False)},
-                                ],
-                                max_tokens=1000,
-                                temperature=0.4,
-                            )
-                            with st.expander("NVIDIA AI 콘티 설명", expanded=True):
-                                st.write(ai_text)
-                        except Exception as e:
-                            st.warning(f"NVIDIA AI 설명 생성 실패: {e}")
-
-            st.markdown("## 선택한 콘티")
-            render_conti(selected_idx, contis[selected_idx], expanded=True)
-
-            if show_all_sets:
-                st.markdown("## 전체 추천 콘티 세트")
-                for idx, conti in enumerate(contis):
-                    if idx == selected_idx:
-                        continue
-                    render_conti(idx, conti, expanded=False)
+                if use_ai_conti_note and nvidia_api_key:
+                    try:
+                        prompt = {
+                            "sections": sections,
+                            "songs": out_rows,
+                            "connection_reasons": conti["reasons"],
+                        }
+                        ai_text = nvidia_chat_completion(
+                            api_key=nvidia_api_key,
+                            base_url=nvidia_base_url,
+                            model=nvidia_model,
+                            messages=[
+                                {"role": "system", "content": "너는 교회 찬양단 콘티를 돕는 예배 음악 코치야. 과장하지 말고 실제 인도자가 이해하기 쉽게 설명해."},
+                                {"role": "user", "content": "다음 콘티를 구간별 분위기, 곡 연결 방식, 인도 팁 중심으로 한국어로 짧게 정리해줘.\n" + json.dumps(prompt, ensure_ascii=False)},
+                            ],
+                            max_tokens=1000,
+                            temperature=0.4,
+                        )
+                        with st.expander("NVIDIA AI 콘티 설명", expanded=True):
+                            st.write(ai_text)
+                    except Exception as e:
+                        st.warning(f"NVIDIA AI 설명 생성 실패: {sanitize_error_message(e, nvidia_api_key)}")
 
 elif menu == "5. DB 관리":
-    st.subheader("4. DB 관리")
+    st.subheader("5. DB 관리")
     df = query_df(
         """
         SELECT id, clean_title, team, channel_title, speed, bpm, song_key, first_chord, last_chord,
